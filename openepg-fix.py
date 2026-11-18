@@ -45,9 +45,16 @@ NEVER_SERIES = [r"Grey Cup", r"^Movie:", r"^Sign[- ]Off"]
 
 # "S08 E14 — Title" / "S08 E14Description" / "S08 E14 - Title"
 SE_RE = re.compile(r"^\s*S(\d+)\s*E(\d+)\s*(?:(—|–|-)\s*)?(.*)$", re.S)
+
 # Episode title runs straight into the description: "...BagA W5 investigation".
 # Boundary = lowercase/digit/punctuation immediately followed by a capital, no space.
-BOUNDARY_RE = re.compile(r"(?<=[a-z0-9.!?'’\")])(?=[A-Z])")
+# Also need special handling for quotes to only split on second one
+_END = r"[a-z0-9.!?)]"
+_QUOTE = r"[\"'’”]"
+BOUNDARY_RE = re.compile(
+    rf"(?:(?<={_END})|(?<={_END}{_QUOTE})|(?<={_END}\\{_QUOTE}))(?=[A-Z])"
+)
+#BOUNDARY_RE = re.compile(r"(?<=[a-z0-9.!?'’\")])(?=[A-Z])")
 MAX_SUBTITLE = 120
 
 
@@ -99,7 +106,7 @@ def show_key(p):
 
 def parse_desc_episode(p):
     """Return (season, episode, ep_title, clean_desc) or None."""
-    desc = p.findtext("desc") or ""
+    desc = (p.findtext("desc") or "").replace('\\"', '"').replace("\\'", "'")
     m = SE_RE.match(desc)
     if not m:
         return None
