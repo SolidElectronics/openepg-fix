@@ -17,44 +17,54 @@ What it does, per <programme>:
     earlier time get <previously-shown/>, so "record new episodes only" works.
 
 Usage:
-  guide_fix.py                          # fetch SOURCE_URL, write OUTPUT_PATH
-  guide_fix.py -i in.xml -o out.xml     # local file in/out (testing)
-  guide_fix.py --seed old1.xml old2.xml # only add old guide files to history
+  openepg_fix.py                          # fetch SOURCE_URL, write OUTPUT_PATH
+  openepg_fix.py -i in.xml -o out.xml     # local file in/out (testing)
+  openepg_fix.py --seed old1.xml old2.xml # only add old guide files to history
 """
-import argparse, json, os, re, sys, tempfile, urllib.request
+import argparse, json, os, re, sys, tempfile, time, urllib.request
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-# ---------------- config ----------------
-#SOURCE_URL   = "https://www.open-epg.com/app/pdownload.php?file=yourID.xml"
-OUTPUT_PATH  = Path("/usr/share/jellyfin/guide.xml")  # or any path Jellyfin can read
-HISTORY_PATH = Path("history.json")
-LOCAL_TZ     = ZoneInfo("America/Toronto")
+# ---------------- config (override with environment variables) ----------------
+def _list(name, default):
+    v = os.environ.get(name)
+    return [x.strip() for x in v.split(";;") if x.strip()] if v is not None else default
 
-MIN_DISTINCT_DATES = 2     # no-episode-info shows: seen on this many days => series
-HISTORY_DAYS       = 60
-MOVIE_MIN_MINUTES  = 100   # no-episode-info shows longer than this => movie/special
+SOURCE_URL   = os.environ.get("SOURCE_URL", "https://www.open-epg.com/app/pdownload.php?file=yourID.xml")
+OUTPUT_PATH  = Path(os.environ.get("OUTPUT_PATH", "/data/www/guide.xml"))
+HISTORY_PATH = Path(os.environ.get("HISTORY_PATH", "/data/history.json"))
+LOCAL_TZ     = ZoneInfo(os.environ.get("TZ", "America/Toronto"))
 
-# Regexes matched against <title>.  Use FORCE for weekly/occasional shows that
-# the history check can't catch yet; NEVER for things that must not be a series.
-FORCE_SERIES = [r"^CTV National News", r"^CTV News", r"^Global News"]
-NEVER_SERIES = [r"Grey Cup", r"^Movie:", r"^Sign[- ]Off"]
-# ----------------------------------------
+MIN_DISTINCT_DATES = int(os.environ.get("MIN_DISTINCT_DATES", 2))  # no-episode-info shows
+HISTORY_DAYS       = int(os.environ.get("HISTORY_DAYS", 60))
+MOVIE_MIN_MINUTES  = int(os.environ.get("MOVIE_MIN_MINUTES", 100))
+
+# Local copy of the downloaded source (protects against rate limits / outages).
+# RAW_DIR defaults to a "raw" folder next to the history file.
+MIN_FETCH_HOURS = float(os.environ.get("MIN_FETCH_HOURS", 20))  # younger local copy => don't re-download
+RAW_KEEP_DAYS   = int(os.environ.get("RAW_KEEP_DAYS", 14))      # dated archive copies kept this long
+
+# Regexes matched against <title>.  In env vars, separate patterns with ";;".
+# FORCE for weekly/occasional shows history can't catch yet; NEVER to exclude.
+FORCE_SERIES = _list("FORCE_SERIES", [r"^CTV National News", r"^CTV News", r"^Global News"])
+NEVER_SERIES = _list("NEVER_SERIES", [r"^Movie:", r"^Sign[- ]Off"])
+# ---------------------------------------------------------------------------------
 
 # "S08 E14 — Title" / "S08 E14Description" / "S08 E14 - Title"
 SE_RE = re.compile(r"^\s*S(\d+)\s*E(\d+)\s*(?:(—|–|-)\s*)?(.*)$", re.S)
-
 # Episode title runs straight into the description: "...BagA W5 investigation".
 # Boundary = lowercase/digit/punctuation immediately followed by a capital, no space.
-# Also need special handling for quotes to only split on second one
+# A quote only counts when it CLOSES something, i.e. it follows a word/punctuation
+# character (so ` "Grill` is skipped but `Go Home"The` splits).  The source also
+# sometimes has stray backslashes before quotes (\"), which are allowed here
+# and removed from the text afterwards.
 _END = r"[a-z0-9.!?)]"
 _QUOTE = r"[\"'’”]"
 BOUNDARY_RE = re.compile(
     rf"(?:(?<={_END})|(?<={_END}{_QUOTE})|(?<={_END}\\{_QUOTE}))(?=[A-Z])"
 )
-#BOUNDARY_RE = re.compile(r"(?<=[a-z0-9.!?'’\")])(?=[A-Z])")
 MAX_SUBTITLE = 120
 
 
@@ -220,9 +230,73 @@ def process(root, h):
 
 
 def fetch(url):
-    req = urllib.request.Request(url, headers={"User-Agent": "guide-fix/2.0"})
+    req = urllib.request.Request(url, headers={"User-Agent": "openepg-fix/2.0"})
     with urllib.request.urlopen(req, timeout=60) as r:
         return r.read()
+
+
+def raw_dir():
+    return Path(os.environ.get("RAW_DIR") or HISTORY_PATH.parent / "raw")
+
+
+def fetch_source(force=False):
+    """Get the source guide, keeping a local copy.  Returns (bytes, is_current).
+
+    - A local copy younger than MIN_FETCH_HOURS is used instead of downloading.
+    - A download is only saved if it parses as XML (so an error page can't
+      overwrite a good copy).
+    - If the download fails and a local copy exists, that copy is used and
+      is_current is False.
+    """
+    rdir = raw_dir()
+    latest = rdir / "latest.xml"
+    age_h = (time.time() - latest.stat().st_mtime) / 3600 if latest.exists() else None
+
+    if not force and age_h is not None and age_h < MIN_FETCH_HOURS:
+        print(f"Using local copy ({age_h:.1f}h old); skipping download")
+        return latest.read_bytes(), True
+    try:
+        raw = fetch(SOURCE_URL)
+        ET.fromstring(raw)                       # sanity check
+    except Exception as e:
+        if age_h is None:
+            raise
+        print(f"WARNING: download failed ({e}); using local copy from {age_h:.1f}h ago",
+              file=sys.stderr)
+        return latest.read_bytes(), False
+
+    atomic_write(latest, raw)
+    atomic_write(rdir / f"guide-{datetime.now(LOCAL_TZ):%Y%m%d-%H%M}.xml", raw)
+    cutoff = time.time() - RAW_KEEP_DAYS * 86400
+    for f in rdir.glob("guide-*.xml"):
+        if f.stat().st_mtime < cutoff:
+            f.unlink()
+    print(f"Downloaded {len(raw):,} bytes; saved to {latest}")
+    return raw, True
+
+
+def run_once(input_path=None, out_path=None, h=None, force=False):
+    """Fetch (or read) the guide, process it, write the output. Safe to call repeatedly."""
+    out_path = Path(out_path) if out_path else OUTPUT_PATH
+    h = h if h is not None else load_history()
+    if input_path:
+        raw, current = Path(input_path).read_bytes(), True
+    else:
+        raw, current = fetch_source(force)
+    root = ET.fromstring(raw)
+
+    update_history_from_root(root, h)      # BEFORE processing, so reruns/series see this file
+    stats, synth = process(root, h)
+    save_history(h)
+
+    ET.indent(root)
+    atomic_write(out_path, ET.tostring(root, encoding="utf-8", xml_declaration=True))
+    print(f"{stats['total']} programmes: {stats['from_desc']} had S/E in desc, "
+          f"{stats['synthetic']} given synthetic numbers, {stats['rerun']} marked rerun, "
+          f"{stats['untouched']} untouched")
+    if synth:
+        print("Synthetic-numbered shows:", ", ".join(sorted(synth)))
+    return current        # False => download failed and an older local copy was used
 
 
 def main():
@@ -230,6 +304,8 @@ def main():
     ap.add_argument("-i", "--input", help="local XMLTV file instead of SOURCE_URL")
     ap.add_argument("-o", "--output", help="output path (default OUTPUT_PATH)")
     ap.add_argument("--history", help="history file (default HISTORY_PATH)")
+    ap.add_argument("--force-fetch", action="store_true",
+                    help="download even if the local copy is recent")
     ap.add_argument("--seed", nargs="+", help="old XMLTV files to add to history only")
     args = ap.parse_args()
 
@@ -246,25 +322,12 @@ def main():
         print(f"Seeded history from {len(args.seed)} file(s).")
         return
 
-    raw = Path(args.input).read_bytes() if args.input else fetch(SOURCE_URL)
-    root = ET.fromstring(raw)
-
-    update_history_from_root(root, h)      # BEFORE processing, so reruns/series see this file
-    stats, synth = process(root, h)
-    save_history(h)
-
-    ET.indent(root)
-    atomic_write(out_path, ET.tostring(root, encoding="utf-8", xml_declaration=True))
-    print(f"{stats['total']} programmes: {stats['from_desc']} had S/E in desc, "
-          f"{stats['synthetic']} given synthetic numbers, {stats['rerun']} marked rerun, "
-          f"{stats['untouched']} untouched")
-    if synth:
-        print("Synthetic-numbered shows:", ", ".join(sorted(synth)))
+    run_once(args.input, out_path, h, force=args.force_fetch)
 
 
 if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        print(f"guide_fix failed: {e}", file=sys.stderr)
+        print(f"openepg_fix failed: {e}", file=sys.stderr)
         sys.exit(1)   # previous output stays in place (writes are atomic)
