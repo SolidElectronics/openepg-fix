@@ -21,7 +21,7 @@ Usage:
   openepg_fix.py -i in.xml -o out.xml     # local file in/out (testing)
   openepg_fix.py --seed old1.xml old2.xml # only add old guide files to history
 """
-import argparse, json, os, re, sys, tempfile, time, urllib.request
+import argparse, hashlib, json, os, re, sys, tempfile, time, urllib.request
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -32,7 +32,7 @@ def _list(name, default):
     v = os.environ.get(name)
     return [x.strip() for x in v.split(";;") if x.strip()] if v is not None else default
 
-SOURCE_URL   = os.environ.get("SOURCE_URL", "https://www.open-epg.com/app/pdownload.php?file=yourID.xml")
+SOURCE_URL   = os.environ.get("SOURCE_URL", "https://example.com/guide.xml")
 OUTPUT_PATH  = Path(os.environ.get("OUTPUT_PATH", "/data/www/guide.xml"))
 HISTORY_PATH = Path(os.environ.get("HISTORY_PATH", "/data/history.json"))
 LOCAL_TZ     = ZoneInfo(os.environ.get("TZ", "America/Toronto"))
@@ -49,7 +49,12 @@ RAW_KEEP_DAYS   = int(os.environ.get("RAW_KEEP_DAYS", 14))      # dated archive 
 # Regexes matched against <title>.  In env vars, separate patterns with ";;".
 # FORCE for weekly/occasional shows history can't catch yet; NEVER to exclude.
 FORCE_SERIES = _list("FORCE_SERIES", [r"^CTV National News", r"^CTV News", r"^Global News"])
-NEVER_SERIES = _list("NEVER_SERIES", [r"^Movie:", r"^Sign[- ]Off"])
+NEVER_SERIES = _list("NEVER_SERIES", [r"Grey Cup", r"^Movie:", r"^Sign[- ]Off"])
+# Shows with no episode numbers whose <desc> is specific to the episode, so the same
+# description on a later airing means a rerun.  Those reruns reuse the first airing's
+# episode number and get <previously-shown/>.  Don't list daily shows whose
+# description never changes (news): every airing would then count as a rerun.
+SAME_EPISODE_BY_DESC = _list("SAME_EPISODE_BY_DESC", [r"^\(MIS\)Treated"])
 # ---------------------------------------------------------------------------------
 
 # "S08 E14 — Title" / "S08 E14Description" / "S08 E14 - Title"
@@ -97,6 +102,7 @@ def load_history():
         h = {}
     h.setdefault("dates", {})      # "channel|title" -> [YYYY-MM-DD, ...]
     h.setdefault("episodes", {})   # "channel|title|S|E" -> earliest start (ISO, UTC)
+    h.setdefault("descs", {})      # "channel|title|desc-hash" -> earliest start (ISO, UTC)
     return h
 
 
@@ -107,6 +113,7 @@ def save_history(h):
     h["dates"] = {k: v for k, v in h["dates"].items() if v}
     cut_iso = cutoff.astimezone(timezone.utc).isoformat()
     h["episodes"] = {k: v for k, v in h["episodes"].items() if v >= cut_iso}
+    h["descs"] = {k: v for k, v in h["descs"].items() if v >= cut_iso}
     atomic_write(HISTORY_PATH, json.dumps(h).encode())
 
 
@@ -132,6 +139,35 @@ def parse_desc_episode(p):
     return season, episode, ep_title, clean
 
 
+def matches(patterns, title):
+    return any(re.search(rx, title or "", re.I) for rx in patterns)
+
+
+def desc_key(p):
+    """History key for 'same description = same episode' shows, else None."""
+    title, desc = p.findtext("title") or "", (p.findtext("desc") or "").strip()
+    if not desc or norm(desc) == norm(title) or not matches(SAME_EPISODE_BY_DESC, title):
+        return None
+    return f"{show_key(p)}|{hashlib.md5(desc.encode()).hexdigest()[:12]}"
+
+
+def split_embedded_title(title, desc):
+    """'Show investigates: TopicDescription...' -> ('Show investigates: Topic', 'Description...').
+
+    For shows without S/E data whose desc starts with the show name and a colon,
+    with the description jammed straight onto the end of the episode title.
+    The split is at the first lowercase-to-capital transition after the show name."""
+    if not desc.startswith(title):
+        return None
+    b = BOUNDARY_RE.search(desc, len(title) + 1)
+    if not b or b.start() > MAX_SUBTITLE:
+        return None
+    head = desc[:b.start()].strip()
+    if ": " not in head:
+        return None
+    return head, desc[b.start():].strip()
+
+
 def update_history_from_root(root, h):
     for p in root.findall("programme"):
         if not p.findtext("title"):
@@ -140,6 +176,11 @@ def update_history_from_root(root, h):
         dates = h["dates"].setdefault(show_key(p), [])
         if d not in dates:
             dates.append(d)
+        dk = desc_key(p)
+        if dk:
+            start = parse_time(p.get("start")).astimezone(timezone.utc).isoformat()
+            if dk not in h["descs"] or start < h["descs"][dk]:
+                h["descs"][dk] = start
         info = parse_desc_episode(p)
         if info:
             ek = f"{show_key(p)}|{info[0]}|{info[1]}"
@@ -217,11 +258,25 @@ def process(root, h):
                 stats["rerun"] += 1
         elif not has_real_episode(p) and is_series(p, h):
             # No episode info anywhere: unique, date-based numbering per airing.
-            season = start.year
-            episode = int(start.strftime("%m%d%H%M"))      # e.g. 11170630
+            num_start = start
+            dk = desc_key(p)
+            first = h["descs"].get(dk) if dk else None
+            is_rerun = bool(first and first < start_utc)   # same description seen earlier
+            if first:
+                num_start = datetime.fromisoformat(first).astimezone(LOCAL_TZ)
+            season = num_start.year
+            episode = int(num_start.strftime("%m%d%H%M"))      # e.g. 11170630
             set_episode_num(p, season, episode)
+            if is_rerun:                    # after episode-num, as the XMLTV DTD orders it
+                add_previously_shown(p)
+                stats["rerun"] += 1
             if not (p.findtext("sub-title") or "").strip():
-                set_text(p, "sub-title", start.strftime("%Y-%m-%d %H:%M"), after="title")
+                emb = split_embedded_title(title, (p.findtext("desc") or "").strip())
+                if emb:
+                    set_text(p, "sub-title", emb[0], after="title")
+                    set_text(p, "desc", emb[1])
+                else:
+                    set_text(p, "sub-title", start.strftime("%Y-%m-%d %H:%M"), after="title")
             stats["synthetic"] += 1
             synthetic_titles.add(title)
         else:
