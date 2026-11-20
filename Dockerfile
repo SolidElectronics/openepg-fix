@@ -17,6 +17,6 @@ VOLUME /data
 EXPOSE 8080
 
 HEALTHCHECK --interval=5m --timeout=10s --start-period=60s \
-  CMD python -c "import urllib.request as u; u.urlopen('http://localhost:80/guide.xml', timeout=5)" || exit 1
+  CMD python -c "import urllib.request as u; u.urlopen(u.Request('http://localhost:8080/guide.xml', method='HEAD'), timeout=5)" || exit 1
 
 CMD ["python", "server.py"]

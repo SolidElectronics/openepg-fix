@@ -5,7 +5,7 @@ Env vars (see also openepg_fix.py):
   SOURCE_URL   guide XML to download (required)
   RUN_AT       daily refresh time, local (TZ), HH:MM            default 04:00
   TZ           timezone name                                     default America/Toronto
-  PORT         HTTP port                                         default 80
+  PORT         HTTP port                                         default 8080
   DATA_DIR     persistent dir (history + served file)            default /data
   RETRY_MINUTES  wait before retrying a failed refresh           default 60
 
@@ -25,7 +25,7 @@ os.environ.setdefault("HISTORY_PATH", str(DATA_DIR / "history.json"))
 import openepg_fix  # noqa: E402  (must come after the env defaults above)
 
 RUN_AT = os.environ.get("RUN_AT", "04:00")
-PORT = int(os.environ.get("PORT", 80))
+PORT = int(os.environ.get("PORT", 8080))
 RETRY_MIN = int(os.environ.get("RETRY_MINUTES", 60))
 
 
@@ -35,9 +35,18 @@ class Handler(SimpleHTTPRequestHandler):
         return None
 
 
+class Server(ThreadingHTTPServer):
+    def handle_error(self, request, client_address):
+        # Clients that hang up mid-download (health checks, Jellyfin timeouts)
+        # are normal; don't print a traceback for them.
+        if isinstance(sys.exc_info()[1], (BrokenPipeError, ConnectionResetError)):
+            return
+        super().handle_error(request, client_address)
+
+
 def serve():
     WWW_DIR.mkdir(parents=True, exist_ok=True)
-    srv = ThreadingHTTPServer(("0.0.0.0", PORT), partial(Handler, directory=str(WWW_DIR)))
+    srv = Server(("0.0.0.0", PORT), partial(Handler, directory=str(WWW_DIR)))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     print(f"Serving {WWW_DIR} on :{PORT}", flush=True)
 
