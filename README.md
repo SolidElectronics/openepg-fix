@@ -49,7 +49,7 @@ docker run -d --name openepg-fix --restart unless-stopped \
   -e SOURCE_URL="https://example.com/guide.xml" \
   -e TZ=America/Toronto \
   -e RUN_AT=04:00 \
-  -v guide-data:/data \
+  -v openepg_fix:/data \
   openepg-fix
 ```
 

@@ -14,7 +14,7 @@ services:
       # FORCE_SERIES: "^CTV National News;;^CTV News;;^Global News"
       # NEVER_SERIES: "^Movie"
     volumes:
-      - guide-data:/data
+      - openepg_fix:/data
 
 volumes:
-  guide-data:
+  openepg_fix:
