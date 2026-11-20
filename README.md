@@ -29,7 +29,7 @@ The processed guide is served at `http://<host>:8080/guide.xml`.
 No registry is needed. Build the image on the machine that will run it:
 
 ```sh
-cd openepg-fix
+cd openepg-fix-docker
 docker build -t openepg-fix .
 ```
 
@@ -45,7 +45,7 @@ With plain Docker (replace the `SOURCE_URL`):
 
 ```sh
 docker run -d --name openepg-fix --restart unless-stopped \
-  -p 80:80 \
+  -p 8080:8080 \
   -e SOURCE_URL="https://example.com/guide.xml" \
   -e TZ=America/Toronto \
   -e RUN_AT=04:00 \
@@ -65,6 +65,47 @@ Check that it works:
 docker logs openepg-fix                 # should show the first refresh
 curl http://localhost:8080/guide.xml    # should return the processed XML
 ```
+
+## Run with Portainer (stack)
+
+The image isn't published anywhere, so build it once on the Docker host as
+above (`docker build -t openepg-fix:latest .`). It then appears in Portainer
+under Images, and a stack can reference it by name:
+
+```yaml
+  # OpenEPG Fix
+  openepg-fix:
+    container_name: openepg-fix
+    image: openepg-fix:latest
+    volumes:
+      - openepg_fix:/data
+    environment:
+      - SOURCE_URL=https://example.com/guide.xml
+      - TZ=America/Toronto
+      - RUN_AT=04:00
+    restart: unless-stopped
+    networks:
+      macvlan_network:
+        aliases:
+          - epg.docker
+```
+
+Also add `openepg_fix:` to the stack's top-level `volumes:` section.
+
+Notes:
+
+- **Don't quote `TZ` in list-style `environment`.** `- TZ="America/Toronto"`
+  passes the quote marks as part of the value, and the timezone is then
+  rejected. Write `- TZ=America/Toronto`.
+- **No `ports:` needed on a macvlan network.** The container has its own IP, so
+  the server is reachable on port 8080 of that address (for example
+  `http://epg.docker:8080/guide.xml`).
+- **Don't enable "re-pull image"** for this stack: there is no registry copy to
+  pull. After rebuilding the image, redeploy the stack and Portainer uses the
+  new local image.
+- **Other ways to get the image:** Portainer's Images → Build a new image
+  (from an uploaded tar or a Git URL), or push to a registry such as
+  `ghcr.io` and use that image name instead.
 
 ## Point Jellyfin at it
 
@@ -135,7 +176,7 @@ docker rm -f openepg-fix
 # ...then repeat the docker run command above
 ```
 
-The `guide-data` volume keeps your history and local copies across rebuilds.
+The `openepg_fix` volume keeps your history and local copies across rebuilds.
 
 **Force a download now** (ignores the local-copy age check; use sparingly if
 your source has a rate limit):
